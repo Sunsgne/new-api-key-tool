@@ -9,7 +9,7 @@ import './index.css';
 import { ThemeProvider } from './context/Theme';
 
 const root = ReactDOM.createRoot(document.getElementById('root'));
-const { Sider, Content, Header } = Layout;
+const { Content, Header } = Layout;
 root.render(
   <ThemeProvider>
     <Layout style={{ minHeight: '100vh' }}>

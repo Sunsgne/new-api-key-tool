@@ -1,4 +1,4 @@
-import { Nav, Typography } from '@douyinfe/semi-ui';
+import { Nav } from '@douyinfe/semi-ui';
 import { IconTag } from '@douyinfe/semi-icons-lab';
 import {
   IconGithubLogo,
@@ -24,7 +24,7 @@ const HeaderBar = () => {
         mode='horizontal'
         header={
           {
-            text: '令牌查询',
+            text: process.env.REACT_APP_TITLE || '令牌用量查询',
             logo: (
               <div style={{ width: '100%', height: '100%' }}>
                 < IconTag size='large' />
