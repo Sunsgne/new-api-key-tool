@@ -62,12 +62,16 @@ vim .env
 
 3. 构建并运行 Docker 容器:
 ```bash
-# 构建镜像
+# 构建镜像（使用 node:22 + npmmirror 源，nginx 监听 8080）
 docker build -t new-api-key-tool .
 
-# 运行容器
-docker run -d -p 80:80 --name new-api-key-tool new-api-key-tool
+# 运行容器，将宿主机 8080 端口映射到容器 8080
+docker run -d -p 8080:8080 --name new-api-key-tool new-api-key-tool
+# 浏览器访问 http://localhost:8080
 ```
+
+> 镜像构建时会读取项目根目录下的 `.env`（若不存在则自动回退到 `.env.example`，默认指向 `https://ai.xxturbo.com`）。
+> 由于 `REACT_APP_*` 变量在 `npm run build` 时被打包进静态文件，修改站点地址后需重新构建镜像。
 
 ### 二次开发（仿 https://usage.wenwen-ai.com/ ）
 

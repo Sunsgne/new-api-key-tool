@@ -1,18 +1,28 @@
-FROM node:16 as builder
+FROM node:22 AS builder
 
-WORKDIR /build
-COPY . /app
-#COPY ./VERSION .
 WORKDIR /app
-RUN npm install
+
+COPY package*.json ./
+
+RUN npm config set registry https://registry.npmmirror.com \
+    && npm install --legacy-peer-deps --no-audit --no-fund
+
+COPY . .
+
+# 若未提供 .env，则使用 .env.example 作为默认配置（指向 https://ai.xxturbo.com）
+RUN [ -f .env ] || cp .env.example .env
+
+ENV NODE_OPTIONS=--openssl-legacy-provider
+
 RUN npm run build
 
 
+FROM nginx:stable-alpine3.23-perl
 
-FROM nginx:1.19.0-alpine
-# 将构建的React应用复制到Nginx的html目录
 COPY --from=builder /app/build /usr/share/nginx/html
-# 暴露端口80
-EXPOSE 80
-# 启动Nginx
+
+COPY nginx.conf /etc/nginx/conf.d/default.conf
+
+EXPOSE 8080
+
 CMD ["nginx", "-g", "daemon off;"]
