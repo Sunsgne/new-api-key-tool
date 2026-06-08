@@ -37,6 +37,7 @@ import {
     getDatePresets,
     aggregateLogsByDay,
     aggregateQuotaDataByDay,
+    formatDateYMD,
     maskToken,
 } from '../helpers/usage';
 import { timestamp2string } from '../helpers';
@@ -52,6 +53,8 @@ const SHOW_DETAIL = process.env.REACT_APP_SHOW_DETAIL === 'true';
 const PAGE_SIZE = 100;
 const WINDOW_SECONDS = 86400; // 明细按天切窗，避免深度 OFFSET 慢查询
 const WINDOW_CONCURRENCY = 3; // 明细窗口并发数（降低后台 DB 压力）
+// /api/data/self 服务端限制单次时间跨度不超过 1 个月（2592000 秒），需分片调用
+const MONTH_SECONDS = 2592000;
 const MAX_DETAIL_ROWS = (() => {
     const n = parseInt(process.env.REACT_APP_MAX_DETAIL_ROWS, 10);
     return Number.isFinite(n) && n > 0 ? n : 50000;
@@ -215,6 +218,57 @@ async function fetchLogsByWindows(url, baseParams, headers, startTs, endTs, maxR
     return { logs: all, capped };
 }
 
+// 按日聚合（首选）：/api/data/self，受单次 ≤1 个月限制，按月分片后合并
+async function fetchQuotaData(headers, startTs, endTs) {
+    let all = [];
+    let s = startTs;
+    while (s <= endTs) {
+        const e = Math.min(s + MONTH_SECONDS, endTs);
+        const res = await API.get('/api/data/self', {
+            params: { start_timestamp: s, end_timestamp: e },
+            headers,
+        });
+        const body = res && res.data;
+        if (body && body.success && Array.isArray(body.data)) {
+            all = all.concat(body.data);
+        }
+        s = e + 1;
+    }
+    return all;
+}
+
+// 按日成本回退：数据看板未开启时，用 sum(quota) 统计接口逐日精确求和（不拉原始行）
+async function fetchDailyStat(headers, startTs, endTs) {
+    const days = [];
+    for (let s = startTs; s <= endTs; s += WINDOW_SECONDS) {
+        days.push([s, Math.min(s + WINDOW_SECONDS - 1, endTs)]);
+    }
+    const rows = [];
+    let idx = 0;
+    const worker = async () => {
+        while (idx < days.length) {
+            const i = idx;
+            idx += 1;
+            const [ds, de] = days[i];
+            const res = await API.get('/api/log/self/stat', {
+                params: { type: 2, start_timestamp: ds, end_timestamp: de },
+                headers,
+            });
+            const body = res && res.data;
+            const quota = body && body.success && body.data ? body.data.quota || 0 : 0;
+            if (quota > 0) {
+                const date = formatDateYMD(ds);
+                rows.push({ key: date, date, model_name: '', count: null, token_used: null, quota });
+            }
+        }
+    };
+    await Promise.all(
+        Array.from({ length: Math.min(WINDOW_CONCURRENCY, days.length) }, worker),
+    );
+    rows.sort((a, b) => (a.date < b.date ? 1 : -1));
+    return rows;
+}
+
 const LogsTable = () => {
     // 查询方式：access（访问令牌，支持时间范围内全量）/ key（令牌 Key，最多最近 1000 条）
     const [queryType, setQueryType] = useState('access');
@@ -243,6 +297,7 @@ const LogsTable = () => {
     const [activeKeys, setActiveKeys] = useState([]);
     const [pageSize, setPageSize] = useState(ITEMS_PER_PAGE);
     const [capWarning, setCapWarning] = useState(false);
+    const [dailyStatMode, setDailyStatMode] = useState(false); // 按日成本回退（无次数/Tokens 明细）
     const [hasQueried, setHasQueried] = useState(false);
 
     const presets = useMemo(() => getDatePresets(), []);
@@ -306,32 +361,20 @@ const LogsTable = () => {
         let allLogs = [];
         let dData = [];
         let capped = false;
+        let statMode = false;
         if (SHOW_DETAIL) {
             if (mode === 'daily') {
-                // 快速路径：直接用按日聚合接口，单次请求即可
+                // 首选：按日聚合接口（按月分片，支持任意时间范围）
                 try {
-                    const r = await API.get('/api/data/self', {
-                        params: { start_timestamp: startTs, end_timestamp: endTs },
-                        headers,
-                    });
-                    const body = r && r.data;
-                    const arr = body && body.success && Array.isArray(body.data) ? body.data : [];
+                    const arr = await fetchQuotaData(headers, startTs, endTs);
                     dData = aggregateQuotaDataByDay(arr);
                 } catch (e) {
                     dData = [];
                 }
-                // 数据看板未开启（返回为空）时，回退到按窗口拉取日志再聚合
+                // 数据看板未开启（聚合为空）时，回退到逐日 sum(quota) 精确成本（不拉原始行）
                 if (dData.length === 0) {
-                    const r = await fetchLogsByWindows(
-                        '/api/log/self',
-                        { type: 2 },
-                        headers,
-                        startTs,
-                        endTs,
-                        MAX_DETAIL_ROWS,
-                    );
-                    allLogs = r.logs;
-                    capped = r.capped;
+                    dData = await fetchDailyStat(headers, startTs, endTs);
+                    statMode = dData.length > 0;
                 }
             } else {
                 const r = await fetchLogsByWindows(
@@ -346,7 +389,7 @@ const LogsTable = () => {
                 capped = r.capped;
             }
         }
-        return { infos, logs: allLogs, dailyData: dData, capped };
+        return { infos, logs: allLogs, dailyData: dData, capped, statMode };
     };
 
     // ====== key 模式：令牌 Key（最多最近 1000 条，无法按时间过滤，客户端再过滤） ======
@@ -402,7 +445,7 @@ const LogsTable = () => {
         allLogs = allLogs.filter(
             (l) => l.created_at >= startTs && l.created_at <= endTs,
         );
-        return { infos, logs: allLogs, dailyData: [], capped };
+        return { infos, logs: allLogs, dailyData: [], capped, statMode: false };
     };
 
     const runQuery = async (mode) => {
@@ -431,8 +474,9 @@ const LogsTable = () => {
 
         setLoading(true);
         setCapWarning(false);
+        setDailyStatMode(false);
         try {
-            const { infos, logs: allLogs, dailyData: dData, capped } =
+            const { infos, logs: allLogs, dailyData: dData, capped, statMode } =
                 queryType === 'access'
                     ? await fetchByAccessToken(startTs, endTs, mode)
                     : await fetchByTokenKey(startTs, endTs);
@@ -442,6 +486,7 @@ const LogsTable = () => {
             setLogs(allLogs);
             setDailyData(dData || []);
             setCapWarning(capped);
+            setDailyStatMode(!!statMode);
             setHasQueried(true);
 
             const keys = [];
@@ -641,8 +686,18 @@ const LogsTable = () => {
                 ) : null,
             sorter: (a, b) => ('' + a.model_name).localeCompare(b.model_name),
         },
-        { title: '调用次数', dataIndex: 'count', sorter: (a, b) => a.count - b.count },
-        { title: '消耗 Tokens', dataIndex: 'token_used', sorter: (a, b) => a.token_used - b.token_used },
+        {
+            title: '调用次数',
+            dataIndex: 'count',
+            render: (t) => (t == null ? <Text type="tertiary">-</Text> : t),
+            sorter: (a, b) => (a.count || 0) - (b.count || 0),
+        },
+        {
+            title: '消耗 Tokens',
+            dataIndex: 'token_used',
+            render: (t) => (t == null ? <Text type="tertiary">-</Text> : t),
+            sorter: (a, b) => (a.token_used || 0) - (b.token_used || 0),
+        },
         { title: '花费', dataIndex: 'quota', render: (t) => renderQuota(t, 6), sorter: (a, b) => a.quota - b.quota },
     ];
 
@@ -862,6 +917,14 @@ const LogsTable = () => {
                         closeIcon={null}
                         style={{ marginTop: 10 }}
                         description={`「按条查询」明细已达上限 ${MAX_DETAIL_ROWS} 条，仅展示部分数据。大范围请改用「按日查询」（聚合接口，单次请求、不拖垮后台），或缩小时间范围/按模型筛选。`}
+                    />
+                )}
+                {dailyStatMode && (
+                    <Banner
+                        type="info"
+                        closeIcon={null}
+                        style={{ marginTop: 10 }}
+                        description="当前服务端「数据看板」未开启，按日花费为基于日志的精确求和（金额准确、可用于出账），但不含「调用次数 / Tokens」明细。如需按模型/次数维度，请在 NewAPI 后台开启「数据看板」。"
                     />
                 )}
             </Card>
