@@ -48,7 +48,8 @@ const { Panel } = Collapse;
 
 const SHOW_BALANCE = process.env.REACT_APP_SHOW_BALANCE === 'true';
 const SHOW_DETAIL = process.env.REACT_APP_SHOW_DETAIL === 'true';
-const PAGE_SIZE = 1000; // 请求页大小（服务端若有上限，会自动按实际返回值翻页）
+// NewAPI GetPageQuery 对 page_size 的硬上限为 100，传更大也会被截断
+const PAGE_SIZE = 100;
 const FETCH_CONCURRENCY = 6; // 明细模式并发翻页数
 
 function renderTimestamp(timestamp) {
