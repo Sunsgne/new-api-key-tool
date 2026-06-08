@@ -50,7 +50,12 @@ const SHOW_BALANCE = process.env.REACT_APP_SHOW_BALANCE === 'true';
 const SHOW_DETAIL = process.env.REACT_APP_SHOW_DETAIL === 'true';
 // NewAPI GetPageQuery 对 page_size 的硬上限为 100，传更大也会被截断
 const PAGE_SIZE = 100;
-const FETCH_CONCURRENCY = 6; // 明细模式并发翻页数
+const WINDOW_SECONDS = 86400; // 明细按天切窗，避免深度 OFFSET 慢查询
+const WINDOW_CONCURRENCY = 3; // 明细窗口并发数（降低后台 DB 压力）
+const MAX_DETAIL_ROWS = (() => {
+    const n = parseInt(process.env.REACT_APP_MAX_DETAIL_ROWS, 10);
+    return Number.isFinite(n) && n > 0 ? n : 50000;
+})();
 
 function renderTimestamp(timestamp) {
     return timestamp2string(timestamp);
@@ -156,44 +161,58 @@ async function fetchAllPages(url, baseParams, headers) {
     return all;
 }
 
-// 并发分页（用于明细日志，大幅减少串行等待）
-async function fetchPagesParallel(url, baseParams, headers) {
-    const first = await API.get(url, {
-        params: { ...baseParams, p: 1, page_size: PAGE_SIZE },
-        headers,
-    });
-    const body = first && first.data;
-    if (!body || !body.success) return [];
-    const d = body.data || {};
-    const firstItems = extractItems(d);
-    const total = d && typeof d.total === 'number' ? d.total : firstItems.length;
-    // 服务端可能对 page_size 设上限，按首页实际返回数推断真实每页大小
-    const effSize = firstItems.length || PAGE_SIZE;
-    const pages = effSize > 0 ? Math.ceil(total / effSize) : 1;
-    if (pages <= 1) return firstItems;
+// 明细日志拉取：按时间窗口切分（每窗 OFFSET 受单窗行数限制，避免深度 OFFSET 慢查询），
+// 窗口之间用有限并发，整体行数受 maxRows 上限保护。
+async function fetchLogsByWindows(url, baseParams, headers, startTs, endTs, maxRows) {
+    const windows = [];
+    for (let s = startTs; s <= endTs; s += WINDOW_SECONDS) {
+        windows.push([s, Math.min(s + WINDOW_SECONDS - 1, endTs)]);
+    }
+    const all = [];
+    let capped = false;
+    let idx = 0;
 
-    const results = new Array(pages + 1);
-    results[1] = firstItems;
-    let nextPage = 2;
     const worker = async () => {
-        while (true) {
-            const p = nextPage;
-            nextPage += 1;
-            if (p > pages) break;
-            const res = await API.get(url, {
-                params: { ...baseParams, p, page_size: PAGE_SIZE },
-                headers,
-            });
-            const b = res && res.data;
-            results[p] = b && b.success ? extractItems(b.data || {}) : [];
+        while (idx < windows.length && all.length < maxRows) {
+            const myIdx = idx;
+            idx += 1;
+            const [ws, we] = windows[myIdx];
+            let page = 1;
+            while (all.length < maxRows) {
+                const res = await API.get(url, {
+                    params: {
+                        ...baseParams,
+                        start_timestamp: ws,
+                        end_timestamp: we,
+                        p: page,
+                        page_size: PAGE_SIZE,
+                    },
+                    headers,
+                });
+                const b = res && res.data;
+                if (!b || !b.success) break;
+                const items = extractItems(b.data || {});
+                for (const it of items) {
+                    if (all.length >= maxRows) {
+                        capped = true;
+                        break;
+                    }
+                    all.push(it);
+                }
+                if (items.length < PAGE_SIZE) break;
+                page += 1;
+            }
+        }
+        if (idx < windows.length || all.length >= maxRows) {
+            // 仍有未处理窗口或已达上限，标记可能被截断
         }
     };
+
     await Promise.all(
-        Array.from({ length: Math.min(FETCH_CONCURRENCY, pages - 1) }, worker),
+        Array.from({ length: Math.min(WINDOW_CONCURRENCY, windows.length) }, worker),
     );
-    let merged = [];
-    for (let i = 1; i <= pages; i++) merged = merged.concat(results[i] || []);
-    return merged;
+    if (all.length >= maxRows) capped = true;
+    return { logs: all, capped };
 }
 
 const LogsTable = () => {
@@ -286,6 +305,7 @@ const LogsTable = () => {
 
         let allLogs = [];
         let dData = [];
+        let capped = false;
         if (SHOW_DETAIL) {
             if (mode === 'daily') {
                 // 快速路径：直接用按日聚合接口，单次请求即可
@@ -300,23 +320,33 @@ const LogsTable = () => {
                 } catch (e) {
                     dData = [];
                 }
-                // 数据看板未开启（返回为空）时，回退到日志分页聚合
+                // 数据看板未开启（返回为空）时，回退到按窗口拉取日志再聚合
                 if (dData.length === 0) {
-                    allLogs = await fetchPagesParallel(
+                    const r = await fetchLogsByWindows(
                         '/api/log/self',
-                        { type: 2, start_timestamp: startTs, end_timestamp: endTs },
+                        { type: 2 },
                         headers,
+                        startTs,
+                        endTs,
+                        MAX_DETAIL_ROWS,
                     );
+                    allLogs = r.logs;
+                    capped = r.capped;
                 }
             } else {
-                allLogs = await fetchPagesParallel(
+                const r = await fetchLogsByWindows(
                     '/api/log/self',
-                    { type: 2, start_timestamp: startTs, end_timestamp: endTs },
+                    { type: 2 },
                     headers,
+                    startTs,
+                    endTs,
+                    MAX_DETAIL_ROWS,
                 );
+                allLogs = r.logs;
+                capped = r.capped;
             }
         }
-        return { infos, logs: allLogs, dailyData: dData, capped: false };
+        return { infos, logs: allLogs, dailyData: dData, capped };
     };
 
     // ====== key 模式：令牌 Key（最多最近 1000 条，无法按时间过滤，客户端再过滤） ======
@@ -818,12 +848,20 @@ const LogsTable = () => {
                         description="「令牌 Key」方式受 NewAPI 接口限制，仅能返回每个令牌最近 1000 条记录且不支持服务端按时间过滤（此处为客户端过滤）。如需查询时间范围内的全部记录，请切换到「访问令牌」方式。"
                     />
                 )}
-                {capWarning && (
+                {capWarning && queryType === 'key' && (
                     <Banner
                         type="danger"
                         closeIcon={null}
                         style={{ marginTop: 10 }}
                         description="检测到有令牌返回的记录已达 1000 条上限，结果可能不完整。请改用「访问令牌」方式以获取时间范围内的全量数据。"
+                    />
+                )}
+                {capWarning && queryType === 'access' && (
+                    <Banner
+                        type="danger"
+                        closeIcon={null}
+                        style={{ marginTop: 10 }}
+                        description={`「按条查询」明细已达上限 ${MAX_DETAIL_ROWS} 条，仅展示部分数据。大范围请改用「按日查询」（聚合接口，单次请求、不拖垮后台），或缩小时间范围/按模型筛选。`}
                     />
                 )}
             </Card>
