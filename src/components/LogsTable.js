@@ -15,12 +15,14 @@ import {
     Modal,
     Tooltip,
     Empty,
+    Banner,
+    RadioGroup,
+    Radio,
 } from '@douyinfe/semi-ui';
 import {
     IconSearch,
     IconDownload,
     IconPlus,
-    IconImport,
     IconRefresh,
     IconClose,
 } from '@douyinfe/semi-icons';
@@ -45,6 +47,7 @@ const { Panel } = Collapse;
 
 const SHOW_BALANCE = process.env.REACT_APP_SHOW_BALANCE === 'true';
 const SHOW_DETAIL = process.env.REACT_APP_SHOW_DETAIL === 'true';
+const LOG_PAGE_SIZE = 100;
 
 function renderTimestamp(timestamp) {
     return timestamp2string(timestamp);
@@ -122,25 +125,47 @@ function downloadCSV(rows, filename) {
     }
 }
 
+// 通用分页拉取：自动翻页直到取回全部（受 total 或空页限制）
+async function fetchAllPages(url, baseParams, headers) {
+    let page = 1;
+    let all = [];
+    let total = Infinity;
+    let guard = 0;
+    while (all.length < total && guard < 2000) {
+        guard++;
+        const res = await API.get(url, {
+            params: { ...baseParams, p: page, page_size: LOG_PAGE_SIZE },
+            headers,
+        });
+        const body = res && res.data;
+        if (!body || !body.success) break;
+        const d = body.data || {};
+        const items = Array.isArray(d) ? d : d.items || d.records || [];
+        total = d && typeof d.total === 'number' ? d.total : items.length;
+        all = all.concat(items);
+        if (items.length < LOG_PAGE_SIZE) break;
+        page += 1;
+    }
+    return all;
+}
+
 const LogsTable = () => {
-    const baseUrls = useMemo(() => {
-        try {
-            return JSON.parse(process.env.REACT_APP_BASE_URL);
-        } catch (e) {
-            return {};
-        }
-    }, []);
-    const siteKeys = Object.keys(baseUrls);
+    // 查询方式：access（访问令牌，支持时间范围内全量）/ key（令牌 Key，最多最近 1000 条）
+    const [queryType, setQueryType] = useState('access');
 
-    const [siteKey, setSiteKey] = useState(siteKeys[0] || '');
-    const baseUrl = baseUrls[siteKey] || '';
+    // access 模式凭证
+    const [accessToken, setAccessToken] = useState('');
+    const [userId, setUserId] = useState('');
 
-    // 令牌管理
+    // key 模式凭证
     const [tokens, setTokens] = useState([]);
     const [tokenInput, setTokenInput] = useState('');
 
     // 查询条件
-    const [dateRange, setDateRange] = useState([startOfDay(new Date()), endOfDay(new Date())]);
+    const [dateRange, setDateRange] = useState([
+        startOfDay((() => { const d = new Date(); d.setDate(d.getDate() - 7); return d; })()),
+        endOfDay(new Date()),
+    ]);
     const [queryMode, setQueryMode] = useState('daily'); // daily | detail
     const [modelFilter, setModelFilter] = useState('all');
 
@@ -150,12 +175,7 @@ const LogsTable = () => {
     const [logs, setLogs] = useState([]);
     const [activeKeys, setActiveKeys] = useState([]);
     const [pageSize, setPageSize] = useState(ITEMS_PER_PAGE);
-
-    // 从用户名导入
-    const [importVisible, setImportVisible] = useState(false);
-    const [importUsername, setImportUsername] = useState('');
-    const [importAccessToken, setImportAccessToken] = useState('');
-    const [importing, setImporting] = useState(false);
+    const [capWarning, setCapWarning] = useState(false);
 
     const presets = useMemo(() => getDatePresets(), []);
 
@@ -179,31 +199,63 @@ const LogsTable = () => {
     };
 
     const resetFilters = () => {
-        setDateRange([startOfDay(new Date()), endOfDay(new Date())]);
+        setDateRange([
+            startOfDay((() => { const d = new Date(); d.setDate(d.getDate() - 7); return d; })()),
+            endOfDay(new Date()),
+        ]);
         setQueryMode('daily');
         setModelFilter('all');
     };
 
-    const fetchData = async () => {
-        if (tokens.length === 0) {
-            Toast.warning('请先添加要查询的令牌');
-            return;
-        }
-        if (!dateRange || !dateRange[0] || !dateRange[1]) {
-            Toast.warning('请选择查询日期范围');
-            return;
-        }
-        const startTs = toUnixSeconds(startOfDay(dateRange[0]));
-        const endTs = toUnixSeconds(endOfDay(dateRange[1]));
+    // ====== access 模式：访问令牌 + 用户ID ======
+    const fetchByAccessToken = async (startTs, endTs) => {
+        const headers = {
+            Authorization: `Bearer ${accessToken.trim()}`,
+            'New-Api-User': userId.trim(),
+        };
 
-        setLoading(true);
+        const infos = [];
+        if (SHOW_BALANCE) {
+            try {
+                const tokenList = await fetchAllPages('/api/token/', {}, headers);
+                tokenList.forEach((t) => {
+                    infos.push({
+                        token: t.key ? (t.key.startsWith('sk-') ? t.key : `sk-${t.key}`) : '',
+                        name: t.name,
+                        unlimitedQuota: t.unlimited_quota,
+                        totalGranted: (t.remain_quota || 0) + (t.used_quota || 0),
+                        totalUsed: t.used_quota || 0,
+                        totalAvailable: t.remain_quota || 0,
+                        expiresAt: t.expired_time === -1 ? 0 : t.expired_time,
+                        valid: t.status === 1,
+                    });
+                });
+            } catch (e) {
+                // 令牌列表失败不阻断日志查询
+            }
+        }
+
+        let allLogs = [];
+        if (SHOW_DETAIL) {
+            allLogs = await fetchAllPages(
+                '/api/log/self',
+                { type: 2, start_timestamp: startTs, end_timestamp: endTs },
+                headers,
+            );
+        }
+        return { infos, logs: allLogs, capped: false };
+    };
+
+    // ====== key 模式：令牌 Key（最多最近 1000 条，无法按时间过滤，客户端再过滤） ======
+    const fetchByTokenKey = async (startTs, endTs) => {
         const infos = [];
         let allLogs = [];
+        let capped = false;
 
         for (const tk of tokens) {
             if (SHOW_BALANCE) {
                 try {
-                    const usageRes = await API.get(`${baseUrl}/api/usage/token/`, {
+                    const usageRes = await API.get('/api/usage/token/', {
                         headers: { Authorization: `Bearer ${tk}` },
                     });
                     const usageData = usageRes && usageRes.data;
@@ -220,11 +272,7 @@ const LogsTable = () => {
                             valid: true,
                         });
                     } else {
-                        infos.push({
-                            token: tk,
-                            valid: false,
-                            error: (usageData && usageData.message) || '查询失败',
-                        });
+                        infos.push({ token: tk, valid: false, error: (usageData && usageData.message) || '查询失败' });
                     }
                 } catch (e) {
                     infos.push({ token: tk, valid: false, error: '查询失败' });
@@ -233,76 +281,77 @@ const LogsTable = () => {
 
             if (SHOW_DETAIL) {
                 try {
-                    const logRes = await API.get(`${baseUrl}/api/log/token`, {
-                        params: {
-                            start_timestamp: startTs,
-                            end_timestamp: endTs,
-                            page_size: 1000,
-                        },
+                    const logRes = await API.get('/api/log/token', {
                         headers: { Authorization: `Bearer ${tk}` },
                     });
                     const body = logRes && logRes.data;
                     if (body && body.success && Array.isArray(body.data)) {
-                        allLogs = allLogs.concat(
-                            body.data.map((l) => ({ ...l, _token: tk })),
-                        );
+                        if (body.data.length >= 1000) capped = true;
+                        allLogs = allLogs.concat(body.data.map((l) => ({ ...l, _token: tk })));
                     }
                 } catch (e) {
-                    // 单个令牌失败不影响其它令牌
+                    // 单令牌失败不影响其它
                 }
             }
         }
 
-        allLogs.sort((a, b) => b.created_at - a.created_at);
-        setTokenInfos(infos);
-        setLogs(allLogs);
-        const keys = [];
-        if (SHOW_BALANCE) keys.push('1');
-        if (SHOW_DETAIL) keys.push('2');
-        setActiveKeys(keys);
-        setModelFilter('all');
-        setLoading(false);
-
-        const validCount = infos.filter((i) => i.valid).length;
-        if (SHOW_BALANCE && validCount === 0 && allLogs.length === 0) {
-            Toast.error('查询失败，请检查令牌或站点地址是否正确');
-        }
+        // 服务端不支持时间过滤，这里做客户端过滤
+        allLogs = allLogs.filter(
+            (l) => l.created_at >= startTs && l.created_at <= endTs,
+        );
+        return { infos, logs: allLogs, capped };
     };
 
-    const importFromUsername = async () => {
-        if (!importAccessToken.trim()) {
-            Toast.warning('请输入站点访问令牌（Access Token）');
+    const fetchData = async () => {
+        if (!dateRange || !dateRange[0] || !dateRange[1]) {
+            Toast.warning('请选择查询日期范围');
             return;
         }
-        setImporting(true);
-        try {
-            const res = await API.get(`${baseUrl}/api/token/`, {
-                params: { p: 1, size: 999 },
-                headers: { Authorization: `Bearer ${importAccessToken.trim()}` },
-            });
-            const body = res && res.data;
-            let records = [];
-            if (body && body.success) {
-                records = Array.isArray(body.data)
-                    ? body.data
-                    : (body.data && body.data.records) || [];
+        if (queryType === 'access') {
+            if (!accessToken.trim()) {
+                Toast.warning('请输入访问令牌（Access Token）');
+                return;
             }
-            const keys = records
-                .map((r) => (r.key && r.key.startsWith('sk-') ? r.key : `sk-${r.key}`))
-                .filter((k) => TOKEN_REGEX.test(k));
-            if (keys.length === 0) {
-                Toast.error('未能导入任何令牌，请确认访问令牌是否正确，或该站点是否开放令牌列表接口');
-            } else {
-                setTokens((prev) => Array.from(new Set([...prev, ...keys])));
-                Toast.success(`成功导入 ${keys.length} 个令牌`);
-                setImportVisible(false);
-                setImportUsername('');
-                setImportAccessToken('');
+            if (!userId.trim()) {
+                Toast.warning('请输入用户 ID');
+                return;
+            }
+        } else {
+            if (tokens.length === 0) {
+                Toast.warning('请先添加要查询的令牌');
+                return;
+            }
+        }
+
+        const startTs = toUnixSeconds(startOfDay(dateRange[0]));
+        const endTs = toUnixSeconds(endOfDay(dateRange[1]));
+
+        setLoading(true);
+        setCapWarning(false);
+        try {
+            const { infos, logs: allLogs, capped } =
+                queryType === 'access'
+                    ? await fetchByAccessToken(startTs, endTs)
+                    : await fetchByTokenKey(startTs, endTs);
+
+            allLogs.sort((a, b) => b.created_at - a.created_at);
+            setTokenInfos(infos);
+            setLogs(allLogs);
+            setCapWarning(capped);
+
+            const keys = [];
+            if (SHOW_BALANCE) keys.push('1');
+            if (SHOW_DETAIL) keys.push('2');
+            setActiveKeys(keys);
+            setModelFilter('all');
+
+            if (infos.filter((i) => i.valid).length === 0 && allLogs.length === 0) {
+                Toast.error('未查询到数据，请检查凭证、用户 ID 或日期范围是否正确');
             }
         } catch (e) {
-            Toast.error('导入失败，请检查访问令牌与站点地址');
+            Toast.error('查询失败，请检查凭证或上游站点是否可达');
         }
-        setImporting(false);
+        setLoading(false);
     };
 
     // 模型筛选选项
@@ -315,14 +364,15 @@ const LogsTable = () => {
         ];
     }, [logs]);
 
-    const filteredLogs = useMemo(() => {
-        return logs.filter(
-            (l) => modelFilter === 'all' || l.model_name === modelFilter,
-        );
-    }, [logs, modelFilter]);
+    const filteredLogs = useMemo(
+        () => logs.filter((l) => modelFilter === 'all' || l.model_name === modelFilter),
+        [logs, modelFilter],
+    );
 
-    const dailyRows = useMemo(
-        () => aggregateLogsByDay(filteredLogs),
+    const dailyRows = useMemo(() => aggregateLogsByDay(filteredLogs), [filteredLogs]);
+
+    const totalQuotaSpent = useMemo(
+        () => filteredLogs.reduce((sum, l) => sum + (l.quota || 0), 0),
         [filteredLogs],
     );
 
@@ -338,22 +388,18 @@ const LogsTable = () => {
         {
             title: '令牌名称',
             dataIndex: 'token_name',
-            render: (text, record) =>
-                record.type === 0 || record.type === 2 ? (
-                    <Tag color="grey" size="large" onClick={() => copyText(text)}>
-                        {text}
-                    </Tag>
+            render: (text) =>
+                text ? (
+                    <Tag color="grey" size="large" onClick={() => copyText(text)}>{text}</Tag>
                 ) : null,
             sorter: (a, b) => ('' + a.token_name).localeCompare(b.token_name),
         },
         {
             title: '模型',
             dataIndex: 'model_name',
-            render: (text, record) =>
-                record.type === 0 || record.type === 2 ? (
-                    <Tag color={stringToColor(text)} size="large" onClick={() => copyText(text)}>
-                        {text}
-                    </Tag>
+            render: (text) =>
+                text ? (
+                    <Tag color={stringToColor(text)} size="large" onClick={() => copyText(text)}>{text}</Tag>
                 ) : null,
             sorter: (a, b) => ('' + a.model_name).localeCompare(b.model_name),
         },
@@ -372,28 +418,17 @@ const LogsTable = () => {
         {
             title: '提示',
             dataIndex: 'prompt_tokens',
-            render: (text, record) =>
-                record.model_name && record.model_name.startsWith('mj_')
-                    ? null
-                    : record.type === 0 || record.type === 2
-                    ? <span>{text}</span>
-                    : null,
             sorter: (a, b) => a.prompt_tokens - b.prompt_tokens,
         },
         {
             title: '补全',
             dataIndex: 'completion_tokens',
-            render: (text, record) =>
-                parseInt(text) > 0 && (record.type === 0 || record.type === 2)
-                    ? <span>{text}</span>
-                    : null,
             sorter: (a, b) => a.completion_tokens - b.completion_tokens,
         },
         {
             title: '花费',
             dataIndex: 'quota',
-            render: (text, record) =>
-                record.type === 0 || record.type === 2 ? renderQuota(text, 6) : null,
+            render: (text) => renderQuota(text, 6),
             sorter: (a, b) => a.quota - b.quota,
         },
         {
@@ -410,9 +445,7 @@ const LogsTable = () => {
                         </Tooltip>
                     );
                 }
-                if (!other) {
-                    return <Paragraph ellipsis={{ rows: 2 }}>{text}</Paragraph>;
-                }
+                if (!other) return <Paragraph ellipsis={{ rows: 2 }}>{text}</Paragraph>;
                 const content = renderModelPrice(
                     record.prompt_tokens,
                     record.completion_tokens,
@@ -441,11 +474,7 @@ const LogsTable = () => {
             title: '令牌名称',
             dataIndex: 'token_name',
             render: (text) =>
-                text ? (
-                    <Tag color="grey" size="large">{text}</Tag>
-                ) : (
-                    <Text type="tertiary">-</Text>
-                ),
+                text ? <Tag color="grey" size="large">{text}</Tag> : <Text type="tertiary">-</Text>,
             sorter: (a, b) => ('' + a.token_name).localeCompare(b.token_name),
         },
         {
@@ -453,45 +482,34 @@ const LogsTable = () => {
             dataIndex: 'model_name',
             render: (text) =>
                 text ? (
-                    <Tag color={stringToColor(text)} size="large" onClick={() => copyText(text)}>
-                        {text}
-                    </Tag>
+                    <Tag color={stringToColor(text)} size="large" onClick={() => copyText(text)}>{text}</Tag>
                 ) : null,
             sorter: (a, b) => ('' + a.model_name).localeCompare(b.model_name),
         },
-        {
-            title: '调用次数',
-            dataIndex: 'count',
-            sorter: (a, b) => a.count - b.count,
-        },
-        {
-            title: '提示 Tokens',
-            dataIndex: 'prompt_tokens',
-            sorter: (a, b) => a.prompt_tokens - b.prompt_tokens,
-        },
-        {
-            title: '补全 Tokens',
-            dataIndex: 'completion_tokens',
-            sorter: (a, b) => a.completion_tokens - b.completion_tokens,
-        },
-        {
-            title: '花费',
-            dataIndex: 'quota',
-            render: (text) => renderQuota(text, 6),
-            sorter: (a, b) => a.quota - b.quota,
-        },
+        { title: '调用次数', dataIndex: 'count', sorter: (a, b) => a.count - b.count },
+        { title: '提示 Tokens', dataIndex: 'prompt_tokens', sorter: (a, b) => a.prompt_tokens - b.prompt_tokens },
+        { title: '补全 Tokens', dataIndex: 'completion_tokens', sorter: (a, b) => a.completion_tokens - b.completion_tokens },
+        { title: '花费', dataIndex: 'quota', render: (t) => renderQuota(t, 6), sorter: (a, b) => a.quota - b.quota },
     ];
 
-    // ====== 令牌信息表 ======
-    const totalQuotaSpent = useMemo(
-        () => filteredLogs.reduce((sum, l) => sum + (l.quota || 0), 0),
-        [filteredLogs],
-    );
+    const tokenInfoColumns = [
+        { title: '令牌', dataIndex: 'token', render: (t) => <Text type="tertiary">{t ? maskToken(t) : '-'}</Text> },
+        { title: '名称', dataIndex: 'name', render: (t) => t || '未知' },
+        {
+            title: '状态',
+            dataIndex: 'valid',
+            render: (valid) => (valid ? <Tag color="green">有效</Tag> : <Tag color="red">无效</Tag>),
+        },
+        { title: '总额', dataIndex: 'totalGranted', render: (t, r) => (!r.valid ? '未知' : r.unlimitedQuota ? '无限' : renderQuota(r.totalGranted, 3)) },
+        { title: '剩余额度', dataIndex: 'totalAvailable', render: (t, r) => (!r.valid ? '未知' : r.unlimitedQuota ? '无限制' : renderQuota(r.totalAvailable, 3)) },
+        { title: '已用额度', dataIndex: 'totalUsed', render: (t, r) => (!r.valid ? '未知' : r.unlimitedQuota ? '不计算' : renderQuota(r.totalUsed, 3)) },
+        { title: '有效期至', dataIndex: 'expiresAt', render: (t, r) => (!r.valid ? '未知' : r.expiresAt === 0 ? '永不过期' : renderTimestamp(r.expiresAt)) },
+    ];
 
     const exportTokenInfoCSV = (e) => {
         e && e.stopPropagation();
         const rows = tokenInfos.map((i) => ({
-            令牌: maskToken(i.token),
+            令牌: i.token ? maskToken(i.token) : '-',
             名称: i.name || '未知',
             状态: i.valid ? '有效' : '无效',
             总额: i.valid ? (i.unlimitedQuota ? '无限' : renderQuota(i.totalGranted, 3)) : '未知',
@@ -530,110 +548,71 @@ const LogsTable = () => {
         }
     };
 
-    const tokenInfoColumns = [
-        {
-            title: '令牌',
-            dataIndex: 'token',
-            render: (text) => <Text type="tertiary">{maskToken(text)}</Text>,
-        },
-        { title: '名称', dataIndex: 'name', render: (t) => t || '未知' },
-        {
-            title: '状态',
-            dataIndex: 'valid',
-            render: (valid) =>
-                valid ? (
-                    <Tag color="green">有效</Tag>
-                ) : (
-                    <Tag color="red">无效</Tag>
-                ),
-        },
-        {
-            title: '总额',
-            dataIndex: 'totalGranted',
-            render: (t, r) =>
-                !r.valid ? '未知' : r.unlimitedQuota ? '无限' : renderQuota(r.totalGranted, 3),
-        },
-        {
-            title: '剩余额度',
-            dataIndex: 'totalAvailable',
-            render: (t, r) =>
-                !r.valid ? '未知' : r.unlimitedQuota ? '无限制' : renderQuota(r.totalAvailable, 3),
-        },
-        {
-            title: '已用额度',
-            dataIndex: 'totalUsed',
-            render: (t, r) =>
-                !r.valid ? '未知' : r.unlimitedQuota ? '不计算' : renderQuota(r.totalUsed, 3),
-        },
-        {
-            title: '有效期至',
-            dataIndex: 'expiresAt',
-            render: (t, r) =>
-                !r.valid ? '未知' : r.expiresAt === 0 ? '永不过期' : renderTimestamp(r.expiresAt),
-        },
-    ];
-
     return (
         <div style={{ maxWidth: 1280, margin: '0 auto' }}>
             <Card>
-                {siteKeys.length > 1 && (
-                    <div style={{ marginBottom: 16 }}>
-                        <Text strong style={{ marginRight: 8 }}>查询站点：</Text>
-                        <Select
-                            value={siteKey}
-                            onChange={(v) => setSiteKey(v)}
-                            style={{ width: 220 }}
-                            optionList={siteKeys.map((k) => ({ value: k, label: k }))}
+                <div style={{ marginBottom: 16 }}>
+                    <Text strong style={{ marginRight: 12 }}>查询方式：</Text>
+                    <RadioGroup
+                        type="button"
+                        value={queryType}
+                        onChange={(e) => setQueryType(e.target.value)}
+                    >
+                        <Radio value="access">访问令牌（可查时间范围内全量）</Radio>
+                        <Radio value="key">令牌 Key（仅最近 1000 条）</Radio>
+                    </RadioGroup>
+                </div>
+
+                {queryType === 'access' ? (
+                    <Space wrap align="center" style={{ width: '100%' }}>
+                        <Input
+                            value={accessToken}
+                            onChange={setAccessToken}
+                            mode="password"
+                            placeholder="访问令牌 Access Token（NewAPI 个人设置中生成）"
+                            prefix={<IconSearch />}
+                            style={{ width: 460, maxWidth: '100%' }}
                         />
-                    </div>
-                )}
-
-                {/* 令牌输入 + 添加 + 导入 */}
-                <Space style={{ width: '100%' }} align="center" wrap>
-                    <Input
-                        showClear
-                        value={tokenInput}
-                        onChange={setTokenInput}
-                        placeholder="请输入令牌 sk-xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
-                        prefix={<IconSearch />}
-                        style={{ width: 520, maxWidth: '100%' }}
-                        onKeyDown={(e) => {
-                            if (e.key === 'Enter') addToken(tokenInput);
-                        }}
-                    />
-                    <Button icon={<IconPlus />} theme="solid" type="primary" onClick={() => addToken(tokenInput)}>
-                        添加
-                    </Button>
-                    <Button icon={<IconImport />} theme="light" onClick={() => setImportVisible(true)}>
-                        从用户名导入
-                    </Button>
-                </Space>
-
-                {tokens.length > 0 && (
-                    <div style={{ marginTop: 12 }}>
-                        <Space wrap>
-                            {tokens.map((t) => (
-                                <Tag
-                                    key={t}
-                                    color="blue"
-                                    size="large"
-                                    closable
-                                    onClose={() => removeToken(t)}
-                                >
-                                    {maskToken(t)}
-                                </Tag>
-                            ))}
-                            <Button
-                                size="small"
-                                theme="borderless"
-                                type="danger"
-                                icon={<IconClose />}
-                                onClick={() => setTokens([])}
-                            >
-                                清空
+                        <Input
+                            value={userId}
+                            onChange={setUserId}
+                            placeholder="用户 ID"
+                            style={{ width: 160 }}
+                        />
+                    </Space>
+                ) : (
+                    <>
+                        <Space style={{ width: '100%' }} align="center" wrap>
+                            <Input
+                                showClear
+                                value={tokenInput}
+                                onChange={setTokenInput}
+                                placeholder="请输入令牌 sk-xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
+                                prefix={<IconSearch />}
+                                style={{ width: 520, maxWidth: '100%' }}
+                                onKeyDown={(e) => {
+                                    if (e.key === 'Enter') addToken(tokenInput);
+                                }}
+                            />
+                            <Button icon={<IconPlus />} theme="solid" type="primary" onClick={() => addToken(tokenInput)}>
+                                添加
                             </Button>
                         </Space>
-                    </div>
+                        {tokens.length > 0 && (
+                            <div style={{ marginTop: 12 }}>
+                                <Space wrap>
+                                    {tokens.map((t) => (
+                                        <Tag key={t} color="blue" size="large" closable onClose={() => removeToken(t)}>
+                                            {maskToken(t)}
+                                        </Tag>
+                                    ))}
+                                    <Button size="small" theme="borderless" type="danger" icon={<IconClose />} onClick={() => setTokens([])}>
+                                        清空
+                                    </Button>
+                                </Space>
+                            </div>
+                        )}
+                    </>
                 )}
 
                 {/* 筛选条件 */}
@@ -696,6 +675,23 @@ const LogsTable = () => {
                         ))}
                     </Space>
                 </div>
+
+                {queryType === 'key' && (
+                    <Banner
+                        type="warning"
+                        closeIcon={null}
+                        style={{ marginTop: 14 }}
+                        description="「令牌 Key」方式受 NewAPI 接口限制，仅能返回每个令牌最近 1000 条记录且不支持服务端按时间过滤（此处为客户端过滤）。如需查询时间范围内的全部记录，请切换到「访问令牌」方式。"
+                    />
+                )}
+                {capWarning && (
+                    <Banner
+                        type="danger"
+                        closeIcon={null}
+                        style={{ marginTop: 10 }}
+                        description="检测到有令牌返回的记录已达 1000 条上限，结果可能不完整。请改用「访问令牌」方式以获取时间范围内的全量数据。"
+                    />
+                )}
             </Card>
 
             <Card style={{ marginTop: 24 }}>
@@ -705,28 +701,16 @@ const LogsTable = () => {
                             header="令牌信息"
                             itemKey="1"
                             extra={
-                                <Button
-                                    icon={<IconDownload />}
-                                    theme="borderless"
-                                    type="primary"
-                                    onClick={exportTokenInfoCSV}
-                                    disabled={tokenInfos.length === 0}
-                                >
+                                <Button icon={<IconDownload />} theme="borderless" type="primary" onClick={exportTokenInfoCSV} disabled={tokenInfos.length === 0}>
                                     令牌信息导出为CSV文件
                                 </Button>
                             }
                         >
                             <Spin spinning={loading}>
                                 {tokenInfos.length === 0 ? (
-                                    <Empty description="暂无数据，请添加令牌后查询" style={{ padding: 24 }} />
+                                    <Empty description="暂无数据，请查询后查看" style={{ padding: 24 }} />
                                 ) : (
-                                    <Table
-                                        columns={tokenInfoColumns}
-                                        dataSource={tokenInfos}
-                                        rowKey="token"
-                                        pagination={false}
-                                        size="small"
-                                    />
+                                    <Table columns={tokenInfoColumns} dataSource={tokenInfos} rowKey={(r) => r.token || r.name} pagination={false} size="small" />
                                 )}
                             </Spin>
                         </Panel>
@@ -738,16 +722,9 @@ const LogsTable = () => {
                             itemKey="2"
                             extra={
                                 <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
-                                    <Tag shape="circle" color="green">
-                                        汇总花费：{renderQuota(totalQuotaSpent, 4)}
-                                    </Tag>
-                                    <Button
-                                        icon={<IconDownload />}
-                                        theme="borderless"
-                                        type="primary"
-                                        onClick={exportDetailCSV}
-                                        disabled={filteredLogs.length === 0}
-                                    >
+                                    <Tag shape="circle" color="green">汇总花费：{renderQuota(totalQuotaSpent, 4)}</Tag>
+                                    <Tag shape="circle" color="blue">共 {filteredLogs.length} 条</Tag>
+                                    <Button icon={<IconDownload />} theme="borderless" type="primary" onClick={exportDetailCSV} disabled={filteredLogs.length === 0}>
                                         调用详情导出为CSV文件
                                     </Button>
                                 </div>
@@ -755,7 +732,7 @@ const LogsTable = () => {
                         >
                             <Spin spinning={loading}>
                                 {filteredLogs.length === 0 ? (
-                                    <Empty description="暂无数据，请添加令牌后查询" style={{ padding: 24 }} />
+                                    <Empty description="暂无数据，请查询后查看" style={{ padding: 24 }} />
                                 ) : queryMode === 'daily' ? (
                                     <Table
                                         columns={dailyColumns}
@@ -776,7 +753,7 @@ const LogsTable = () => {
                                     <Table
                                         columns={detailColumns}
                                         dataSource={filteredLogs}
-                                        rowKey={(r) => `${r._token}-${r.id || r.created_at}-${Math.random()}`}
+                                        rowKey={(r) => r.id || `${r.token_name}-${r.created_at}-${Math.random()}`}
                                         pagination={{
                                             pageSize,
                                             hideOnSinglePage: true,
@@ -794,39 +771,6 @@ const LogsTable = () => {
                     )}
                 </Collapse>
             </Card>
-
-            <Modal
-                title="从用户名导入令牌"
-                visible={importVisible}
-                onCancel={() => setImportVisible(false)}
-                onOk={importFromUsername}
-                okText="导入"
-                cancelText="取消"
-                confirmLoading={importing}
-            >
-                <Text type="secondary">
-                    输入站点的「访问令牌（Access Token）」，将自动导入该账号下的全部令牌。
-                </Text>
-                <div style={{ marginTop: 16 }}>
-                    <Text>用户名（可选）</Text>
-                    <Input
-                        value={importUsername}
-                        onChange={setImportUsername}
-                        placeholder="用于备注，不影响导入"
-                        style={{ marginTop: 6 }}
-                    />
-                </div>
-                <div style={{ marginTop: 16 }}>
-                    <Text>访问令牌 Access Token</Text>
-                    <Input
-                        value={importAccessToken}
-                        onChange={setImportAccessToken}
-                        placeholder="在 NewAPI 个人设置中生成的访问令牌"
-                        mode="password"
-                        style={{ marginTop: 6 }}
-                    />
-                </div>
-            </Modal>
         </div>
     );
 };
