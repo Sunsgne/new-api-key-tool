@@ -36,6 +36,7 @@ import {
     toUnixSeconds,
     getDatePresets,
     aggregateLogsByDay,
+    aggregateQuotaDataByDay,
     maskToken,
 } from '../helpers/usage';
 import { timestamp2string } from '../helpers';
@@ -47,7 +48,8 @@ const { Panel } = Collapse;
 
 const SHOW_BALANCE = process.env.REACT_APP_SHOW_BALANCE === 'true';
 const SHOW_DETAIL = process.env.REACT_APP_SHOW_DETAIL === 'true';
-const LOG_PAGE_SIZE = 100;
+const PAGE_SIZE = 1000; // 请求页大小（服务端若有上限，会自动按实际返回值翻页）
+const FETCH_CONCURRENCY = 6; // 明细模式并发翻页数
 
 function renderTimestamp(timestamp) {
     return timestamp2string(timestamp);
@@ -125,28 +127,72 @@ function downloadCSV(rows, filename) {
     }
 }
 
-// 通用分页拉取：自动翻页直到取回全部（受 total 或空页限制）
+function extractItems(d) {
+    return Array.isArray(d) ? d : (d && (d.items || d.records)) || [];
+}
+
+// 串行分页（用于数据量较小的接口，如令牌列表）
 async function fetchAllPages(url, baseParams, headers) {
     let page = 1;
     let all = [];
     let total = Infinity;
     let guard = 0;
-    while (all.length < total && guard < 2000) {
+    while (all.length < total && guard < 5000) {
         guard++;
         const res = await API.get(url, {
-            params: { ...baseParams, p: page, page_size: LOG_PAGE_SIZE },
+            params: { ...baseParams, p: page, page_size: PAGE_SIZE },
             headers,
         });
         const body = res && res.data;
         if (!body || !body.success) break;
         const d = body.data || {};
-        const items = Array.isArray(d) ? d : d.items || d.records || [];
+        const items = extractItems(d);
         total = d && typeof d.total === 'number' ? d.total : items.length;
         all = all.concat(items);
-        if (items.length < LOG_PAGE_SIZE) break;
+        if (items.length === 0) break;
         page += 1;
     }
     return all;
+}
+
+// 并发分页（用于明细日志，大幅减少串行等待）
+async function fetchPagesParallel(url, baseParams, headers) {
+    const first = await API.get(url, {
+        params: { ...baseParams, p: 1, page_size: PAGE_SIZE },
+        headers,
+    });
+    const body = first && first.data;
+    if (!body || !body.success) return [];
+    const d = body.data || {};
+    const firstItems = extractItems(d);
+    const total = d && typeof d.total === 'number' ? d.total : firstItems.length;
+    // 服务端可能对 page_size 设上限，按首页实际返回数推断真实每页大小
+    const effSize = firstItems.length || PAGE_SIZE;
+    const pages = effSize > 0 ? Math.ceil(total / effSize) : 1;
+    if (pages <= 1) return firstItems;
+
+    const results = new Array(pages + 1);
+    results[1] = firstItems;
+    let nextPage = 2;
+    const worker = async () => {
+        while (true) {
+            const p = nextPage;
+            nextPage += 1;
+            if (p > pages) break;
+            const res = await API.get(url, {
+                params: { ...baseParams, p, page_size: PAGE_SIZE },
+                headers,
+            });
+            const b = res && res.data;
+            results[p] = b && b.success ? extractItems(b.data || {}) : [];
+        }
+    };
+    await Promise.all(
+        Array.from({ length: Math.min(FETCH_CONCURRENCY, pages - 1) }, worker),
+    );
+    let merged = [];
+    for (let i = 1; i <= pages; i++) merged = merged.concat(results[i] || []);
+    return merged;
 }
 
 const LogsTable = () => {
@@ -173,9 +219,11 @@ const LogsTable = () => {
     const [loading, setLoading] = useState(false);
     const [tokenInfos, setTokenInfos] = useState([]);
     const [logs, setLogs] = useState([]);
+    const [dailyData, setDailyData] = useState([]); // 按日快速统计（来自 /api/data/self）
     const [activeKeys, setActiveKeys] = useState([]);
     const [pageSize, setPageSize] = useState(ITEMS_PER_PAGE);
     const [capWarning, setCapWarning] = useState(false);
+    const [hasQueried, setHasQueried] = useState(false);
 
     const presets = useMemo(() => getDatePresets(), []);
 
@@ -208,7 +256,7 @@ const LogsTable = () => {
     };
 
     // ====== access 模式：访问令牌 + 用户ID ======
-    const fetchByAccessToken = async (startTs, endTs) => {
+    const fetchByAccessToken = async (startTs, endTs, mode) => {
         const headers = {
             Authorization: `Bearer ${accessToken.trim()}`,
             'New-Api-User': userId.trim(),
@@ -236,14 +284,38 @@ const LogsTable = () => {
         }
 
         let allLogs = [];
+        let dData = [];
         if (SHOW_DETAIL) {
-            allLogs = await fetchAllPages(
-                '/api/log/self',
-                { type: 2, start_timestamp: startTs, end_timestamp: endTs },
-                headers,
-            );
+            if (mode === 'daily') {
+                // 快速路径：直接用按日聚合接口，单次请求即可
+                try {
+                    const r = await API.get('/api/data/self', {
+                        params: { start_timestamp: startTs, end_timestamp: endTs },
+                        headers,
+                    });
+                    const body = r && r.data;
+                    const arr = body && body.success && Array.isArray(body.data) ? body.data : [];
+                    dData = aggregateQuotaDataByDay(arr);
+                } catch (e) {
+                    dData = [];
+                }
+                // 数据看板未开启（返回为空）时，回退到日志分页聚合
+                if (dData.length === 0) {
+                    allLogs = await fetchPagesParallel(
+                        '/api/log/self',
+                        { type: 2, start_timestamp: startTs, end_timestamp: endTs },
+                        headers,
+                    );
+                }
+            } else {
+                allLogs = await fetchPagesParallel(
+                    '/api/log/self',
+                    { type: 2, start_timestamp: startTs, end_timestamp: endTs },
+                    headers,
+                );
+            }
         }
-        return { infos, logs: allLogs, capped: false };
+        return { infos, logs: allLogs, dailyData: dData, capped: false };
     };
 
     // ====== key 模式：令牌 Key（最多最近 1000 条，无法按时间过滤，客户端再过滤） ======
@@ -299,10 +371,10 @@ const LogsTable = () => {
         allLogs = allLogs.filter(
             (l) => l.created_at >= startTs && l.created_at <= endTs,
         );
-        return { infos, logs: allLogs, capped };
+        return { infos, logs: allLogs, dailyData: [], capped };
     };
 
-    const fetchData = async () => {
+    const runQuery = async (mode) => {
         if (!dateRange || !dateRange[0] || !dateRange[1]) {
             Toast.warning('请选择查询日期范围');
             return;
@@ -329,15 +401,17 @@ const LogsTable = () => {
         setLoading(true);
         setCapWarning(false);
         try {
-            const { infos, logs: allLogs, capped } =
+            const { infos, logs: allLogs, dailyData: dData, capped } =
                 queryType === 'access'
-                    ? await fetchByAccessToken(startTs, endTs)
+                    ? await fetchByAccessToken(startTs, endTs, mode)
                     : await fetchByTokenKey(startTs, endTs);
 
             allLogs.sort((a, b) => b.created_at - a.created_at);
             setTokenInfos(infos);
             setLogs(allLogs);
+            setDailyData(dData || []);
             setCapWarning(capped);
+            setHasQueried(true);
 
             const keys = [];
             if (SHOW_BALANCE) keys.push('1');
@@ -345,7 +419,11 @@ const LogsTable = () => {
             setActiveKeys(keys);
             setModelFilter('all');
 
-            if (infos.filter((i) => i.valid).length === 0 && allLogs.length === 0) {
+            const hasData =
+                infos.filter((i) => i.valid).length > 0 ||
+                allLogs.length > 0 ||
+                (dData && dData.length > 0);
+            if (!hasData) {
                 Toast.error('未查询到数据，请检查凭证、用户 ID 或日期范围是否正确');
             }
         } catch (e) {
@@ -354,27 +432,50 @@ const LogsTable = () => {
         setLoading(false);
     };
 
-    // 模型筛选选项
+    const fetchData = () => runQuery(queryMode);
+
+    // 切换查询模式时，若已查询过则按新模式自动重新拉取（按日/按条用的是不同接口）
+    const handleQueryModeChange = (v) => {
+        setQueryMode(v);
+        if (hasQueried) runQuery(v);
+    };
+
+    // 是否使用了「按日快速统计」数据源（/api/data/self）
+    const usingFastDaily = queryMode === 'daily' && dailyData.length > 0;
+
+    // 模型筛选选项（同时考虑日志与快速统计）
     const modelOptions = useMemo(() => {
         const set = new Set();
         logs.forEach((l) => l.model_name && set.add(l.model_name));
+        dailyData.forEach((d) => d.model_name && set.add(d.model_name));
         return [
             { value: 'all', label: '全部模型' },
             ...Array.from(set).sort().map((m) => ({ value: m, label: m })),
         ];
-    }, [logs]);
+    }, [logs, dailyData]);
 
     const filteredLogs = useMemo(
         () => logs.filter((l) => modelFilter === 'all' || l.model_name === modelFilter),
         [logs, modelFilter],
     );
 
-    const dailyRows = useMemo(() => aggregateLogsByDay(filteredLogs), [filteredLogs]);
+    const dailyRows = useMemo(() => {
+        if (dailyData.length > 0) {
+            return dailyData.filter((d) => modelFilter === 'all' || d.model_name === modelFilter);
+        }
+        return aggregateLogsByDay(filteredLogs);
+    }, [dailyData, filteredLogs, modelFilter]);
 
-    const totalQuotaSpent = useMemo(
-        () => filteredLogs.reduce((sum, l) => sum + (l.quota || 0), 0),
-        [filteredLogs],
-    );
+    // 汇总花费：按日模式用 dailyRows，按条模式用明细
+    const totalQuotaSpent = useMemo(() => {
+        if (queryMode === 'daily') {
+            return dailyRows.reduce((sum, r) => sum + (r.quota || 0), 0);
+        }
+        return filteredLogs.reduce((sum, l) => sum + (l.quota || 0), 0);
+    }, [queryMode, dailyRows, filteredLogs]);
+
+    const detailCount = queryMode === 'daily' ? dailyRows.length : filteredLogs.length;
+    const hasDetailData = queryMode === 'daily' ? dailyRows.length > 0 : filteredLogs.length > 0;
 
     // ====== 列定义 ======
     const detailColumns = [
@@ -492,6 +593,28 @@ const LogsTable = () => {
         { title: '花费', dataIndex: 'quota', render: (t) => renderQuota(t, 6), sorter: (a, b) => a.quota - b.quota },
     ];
 
+    // 快速统计（/api/data/self）列：无令牌名/提示补全拆分，仅总 Tokens
+    const dailyFastColumns = [
+        {
+            title: '日期',
+            dataIndex: 'date',
+            sorter: (a, b) => ('' + a.date).localeCompare(b.date),
+            defaultSortOrder: 'descend',
+        },
+        {
+            title: '模型',
+            dataIndex: 'model_name',
+            render: (text) =>
+                text ? (
+                    <Tag color={stringToColor(text)} size="large" onClick={() => copyText(text)}>{text}</Tag>
+                ) : null,
+            sorter: (a, b) => ('' + a.model_name).localeCompare(b.model_name),
+        },
+        { title: '调用次数', dataIndex: 'count', sorter: (a, b) => a.count - b.count },
+        { title: '消耗 Tokens', dataIndex: 'token_used', sorter: (a, b) => a.token_used - b.token_used },
+        { title: '花费', dataIndex: 'quota', render: (t) => renderQuota(t, 6), sorter: (a, b) => a.quota - b.quota },
+    ];
+
     const tokenInfoColumns = [
         { title: '令牌', dataIndex: 'token', render: (t) => <Text type="tertiary">{t ? maskToken(t) : '-'}</Text> },
         { title: '名称', dataIndex: 'name', render: (t) => t || '未知' },
@@ -523,15 +646,25 @@ const LogsTable = () => {
     const exportDetailCSV = (e) => {
         e && e.stopPropagation();
         if (queryMode === 'daily') {
-            const rows = dailyRows.map((r) => ({
-                日期: r.date,
-                令牌名称: r.token_name,
-                模型: r.model_name,
-                调用次数: r.count,
-                '提示 Tokens': r.prompt_tokens,
-                '补全 Tokens': r.completion_tokens,
-                花费: renderQuota(r.quota, 6),
-            }));
+            const rows = dailyRows.map((r) =>
+                usingFastDaily
+                    ? {
+                          日期: r.date,
+                          模型: r.model_name,
+                          调用次数: r.count,
+                          '消耗 Tokens': r.token_used,
+                          花费: renderQuota(r.quota, 6),
+                      }
+                    : {
+                          日期: r.date,
+                          令牌名称: r.token_name,
+                          模型: r.model_name,
+                          调用次数: r.count,
+                          '提示 Tokens': r.prompt_tokens,
+                          '补全 Tokens': r.completion_tokens,
+                          花费: renderQuota(r.quota, 6),
+                      },
+            );
             downloadCSV(rows, 'usage-daily.csv');
         } else {
             const rows = filteredLogs.map((l) => ({
@@ -632,7 +765,7 @@ const LogsTable = () => {
                         <Text type="secondary" style={{ marginRight: 6 }}>查询模式：</Text>
                         <Select
                             value={queryMode}
-                            onChange={(v) => setQueryMode(v)}
+                            onChange={handleQueryModeChange}
                             style={{ width: 130 }}
                             optionList={[
                                 { value: 'daily', label: '按日查询' },
@@ -723,19 +856,19 @@ const LogsTable = () => {
                             extra={
                                 <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
                                     <Tag shape="circle" color="green">汇总花费：{renderQuota(totalQuotaSpent, 4)}</Tag>
-                                    <Tag shape="circle" color="blue">共 {filteredLogs.length} 条</Tag>
-                                    <Button icon={<IconDownload />} theme="borderless" type="primary" onClick={exportDetailCSV} disabled={filteredLogs.length === 0}>
+                                    <Tag shape="circle" color="blue">共 {detailCount} 条</Tag>
+                                    <Button icon={<IconDownload />} theme="borderless" type="primary" onClick={exportDetailCSV} disabled={!hasDetailData}>
                                         调用详情导出为CSV文件
                                     </Button>
                                 </div>
                             }
                         >
                             <Spin spinning={loading}>
-                                {filteredLogs.length === 0 ? (
+                                {!hasDetailData ? (
                                     <Empty description="暂无数据，请查询后查看" style={{ padding: 24 }} />
                                 ) : queryMode === 'daily' ? (
                                     <Table
-                                        columns={dailyColumns}
+                                        columns={usingFastDaily ? dailyFastColumns : dailyColumns}
                                         dataSource={dailyRows}
                                         rowKey="key"
                                         pagination={{

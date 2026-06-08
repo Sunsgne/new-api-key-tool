@@ -129,6 +129,33 @@ export function aggregateLogsByDay(logs) {
   });
 }
 
+// 聚合 /api/data/self 返回的（按小时+模型）统计为 按日+模型
+export function aggregateQuotaDataByDay(rows) {
+  const map = new Map();
+  for (const r of rows) {
+    const date = formatDateYMD(r.created_at);
+    const key = `${date}|${r.model_name || ''}`;
+    if (!map.has(key)) {
+      map.set(key, {
+        key,
+        date,
+        model_name: r.model_name || '',
+        count: 0,
+        token_used: 0,
+        quota: 0,
+      });
+    }
+    const o = map.get(key);
+    o.count += r.count || 0;
+    o.token_used += r.token_used || 0;
+    o.quota += r.quota || 0;
+  }
+  return Array.from(map.values()).sort((a, b) => {
+    if (a.date !== b.date) return a.date < b.date ? 1 : -1;
+    return b.quota - a.quota;
+  });
+}
+
 export function maskToken(token) {
   if (!token || token.length < 12) return token;
   return `${token.slice(0, 6)}****${token.slice(-4)}`;
