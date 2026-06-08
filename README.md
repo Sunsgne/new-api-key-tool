@@ -69,5 +69,59 @@ docker build -t new-api-key-tool .
 docker run -d -p 80:80 --name new-api-key-tool new-api-key-tool
 ```
 
-### 二次开发
-复制.env.example文件为.env，根据自己需求配置env文件中的环境变量。
+### 二次开发（仿 https://usage.wenwen-ai.com/ ）
+
+本分支在原版令牌查询页的基础上，参照 [usage.wenwen-ai.com](https://usage.wenwen-ai.com/) 进行了二次开发，新增以下能力：
+
+- **多令牌管理**：支持输入并「添加」多个令牌，以标签形式管理，可单独删除或一键清空，多令牌结果自动聚合。
+- **从用户名导入**：通过站点「访问令牌（Access Token）」一键导入该账号下的全部令牌（依赖 NewAPI 的 `/api/token/` 接口）。
+- **日期范围筛选**：内置「开始/结束日期」区间选择，并提供 今天 / 昨天 / 本周 / 上周 / 本月 / 上月 快捷选择。
+- **两种查询模式**：
+  - 按日查询：将调用日志按「日期 + 模型 + 令牌」聚合，展示调用次数、提示/补全 Tokens、花费等汇总信息。
+  - 按条查询：展示逐条调用明细（时间、模型、用时、提示/补全、花费、计费详情）。
+- **模型筛选**：可按模型过滤调用记录，并支持「重置筛选」。
+- **CSV 导出**：分别支持「令牌信息导出为 CSV 文件」与「调用详情导出为 CSV 文件」。
+
+日期范围会通过 `start_timestamp` / `end_timestamp` 传递给 NewAPI 的 `/api/log/token` 接口。
+
+#### 环境变量
+
+复制 `.env.example` 为 `.env`，根据需求配置：
+
+```
+# 展示调用详情
+REACT_APP_SHOW_DETAIL=true
+
+# 展示令牌信息
+REACT_APP_SHOW_BALANCE=true
+
+# 你的 NewAPI 站点地址（支持多站点聚合查询）
+REACT_APP_BASE_URL={"xxTurbo": "https://ai.xxturbo.com"}
+
+# 是否显示 GitHub 图标
+REACT_APP_SHOW_ICONGITHUB=false
+
+# 站点标题（可选）
+REACT_APP_TITLE=xxTurbo 令牌用量查询
+
+# 计费汇率：$1 = ? tokens（可选，默认 500000）
+REACT_APP_QUOTA_PER_UNIT=500000
+```
+
+#### 本地运行 Demo
+
+```bash
+# 1. 安装依赖
+npm install
+
+# 2. 准备环境变量（已内置指向 https://ai.xxturbo.com 的 .env.example）
+cp .env.example .env
+
+# 3. 启动开发服务器
+npm start
+# 浏览器访问 http://localhost:3000
+
+# 或构建生产版本
+npm run build
+npx serve -s build
+```
