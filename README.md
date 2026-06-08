@@ -77,16 +77,27 @@ docker run -d -p 8080:8080 --name new-api-key-tool new-api-key-tool
 
 本分支在原版令牌查询页的基础上，参照 [usage.wenwen-ai.com](https://usage.wenwen-ai.com/) 进行了二次开发，新增以下能力：
 
-- **多令牌管理**：支持输入并「添加」多个令牌，以标签形式管理，可单独删除或一键清空，多令牌结果自动聚合。
-- **从用户名导入**：通过站点「访问令牌（Access Token）」一键导入该账号下的全部令牌（依赖 NewAPI 的 `/api/token/` 接口）。
-- **日期范围筛选**：内置「开始/结束日期」区间选择，并提供 今天 / 昨天 / 本周 / 上周 / 本月 / 上月 快捷选择。
+- **两种查询方式**：
+  - **访问令牌（推荐）**：输入 NewAPI 个人设置中的「访问令牌（Access Token）」+「用户 ID」，调用 `/api/log/self` **按时间范围分页拉取全量调用日志**，并通过 `/api/token/` 展示账号下全部令牌的额度信息。
+  - **令牌 Key（快速）**：输入一个或多个 `sk-` 令牌，调用 `/api/usage/token/` 与 `/api/log/token`。⚠️ 受 NewAPI 接口限制，该方式**每个令牌最多返回最近 1000 条记录，且服务端不支持按时间过滤**（页面会做客户端过滤并给出提示）。
+- **日期范围筛选**：「开始/结束日期」区间选择，并提供 今天 / 昨天 / 本周 / 上周 / 本月 / 上月 快捷选择。
 - **两种查询模式**：
   - 按日查询：将调用日志按「日期 + 模型 + 令牌」聚合，展示调用次数、提示/补全 Tokens、花费等汇总信息。
   - 按条查询：展示逐条调用明细（时间、模型、用时、提示/补全、花费、计费详情）。
-- **模型筛选**：可按模型过滤调用记录，并支持「重置筛选」。
+- **模型筛选** + 「重置筛选」。
 - **CSV 导出**：分别支持「令牌信息导出为 CSV 文件」与「调用详情导出为 CSV 文件」。
 
-日期范围会通过 `start_timestamp` / `end_timestamp` 传递给 NewAPI 的 `/api/log/token` 接口。
+#### 为什么需要反向代理
+
+NewAPI 中只有 `/api/usage/token/` 与 `/api/log/token` 两个接口开启了 CORS（可跨域），而它们**无法按时间过滤、且最多返回 1000 条**。
+真正支持「时间范围 + 分页」的 `/api/log/self`（`GetUserLogs`）**没有开启 CORS**，浏览器跨域无法直接调用。
+
+因此本项目通过**反向代理**把 `/api` 转发到上游 NewAPI 站点，让前端与接口同源，从而可正常调用 `/api/log/self` 拉取时间范围内的全量数据：
+
+- 生产环境：`nginx.conf` 中的 `location /api/ { proxy_pass <上游站点>; }`。
+- 开发环境：`src/setupProxy.js`（基于 `http-proxy-middleware`），代理目标取自 `REACT_APP_UPSTREAM`。
+
+> 更换上游站点：开发改 `.env` 的 `REACT_APP_UPSTREAM`；生产改 `nginx.conf` 中的 `proxy_pass` 与 `Host`。
 
 #### 环境变量
 
@@ -99,8 +110,8 @@ REACT_APP_SHOW_DETAIL=true
 # 展示令牌信息
 REACT_APP_SHOW_BALANCE=true
 
-# 你的 NewAPI 站点地址（支持多站点聚合查询）
-REACT_APP_BASE_URL={"xxTurbo": "https://ai.xxturbo.com"}
+# 上游 NewAPI 站点地址（反向代理目标，使前端与接口同源）
+REACT_APP_UPSTREAM=https://ai.xxturbo.com
 
 # 是否显示 GitHub 图标
 REACT_APP_SHOW_ICONGITHUB=false
