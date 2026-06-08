@@ -123,8 +123,13 @@ export function renderQuotaWithAmount(amount) {
   }
 }
 
+export function getQuotaPerUnitFromEnv() {
+  const fromEnv = parseFloat(process.env.REACT_APP_QUOTA_PER_UNIT);
+  return Number.isFinite(fromEnv) && fromEnv > 0 ? fromEnv : 500000;
+}
+
 export function renderQuota(quota, digits = 2) {
-  let quotaPerUnit = 500000;
+  const quotaPerUnit = getQuotaPerUnitFromEnv();
   return '$' + (quota / quotaPerUnit).toFixed(digits);
 }
 
